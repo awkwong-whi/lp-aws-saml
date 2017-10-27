@@ -49,7 +49,7 @@ LASTPASS_SERVER = 'https://lastpass.com'
 PROXY_SERVER = 'https://127.0.0.1:8443'
 # LASTPASS_SERVER = PROXY_SERVER
 
-logging.basicConfig(level=logging.CRITICAL)
+logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger('lp-aws-saml')
 
 class MfaRequiredException(Exception):
@@ -257,6 +257,44 @@ def aws_assume_role(session, assertion, role_arn, principal_arn, duration=3600):
                 SAMLAssertion=b64encode(assertion),
                 DurationSeconds=duration)
 
+def aws_assume_role_alt(response, alt_arn, session_name, duration=3600):
+    """
+    Returns a new STS assume-role response object using the
+    credentials provided from a previous assume_role call.
+    
+    Credentials from the response parameter (typically created
+    in a previous call to ``aws_assume_role`` are used to then
+    assume a new role (Such as logging into a root AWS
+    Organization account, and then switching roles into an
+    account in the Organization that your main account has
+    rights to assume.  
+    
+    The newly assumed role will be based on the provide alt_arn ARN
+    value, and the session_name value in the assume_role
+    call.
+
+    Your final assumed ARN will typically then become:
+        ``arn:aws:sts::123456789012:assumed-role/rolename/session_name``
+
+    :param response: response object from ``aws_assume_role``
+    :param alt_arn: ARN of the role to assume
+    :param session_name: Session name
+    :param duration: duration in seconds (900-3600) of the role session
+    :type response: str
+    :type alt_arn: str
+    :type session_name: str
+    :type duration: int
+    :returns: The assume_role response object
+    """
+    credentials = response['Credentials']
+    client = boto3.client('sts',
+                aws_access_key_id=credentials['AccessKeyId'],
+                aws_secret_access_key=credentials['SecretAccessKey'],
+                aws_session_token=credentials['SessionToken'])
+    return client.assume_role(
+                RoleArn=alt_arn,
+                RoleSessionName=session_name,
+                DurationSeconds=duration)
 
 def aws_set_profile(profile_name, response):
     """
@@ -301,6 +339,17 @@ def main():
     duration_arg = parser.add_argument('--duration', type=int, default=3600, dest='duration',
                     help='duration in seconds (900-3600) of the role session (default is 3600 or 1 hour)')
 
+    group_alt = parser.add_argument_group(
+                    title='optional alternate role arguments', 
+                    description='Assume an alternate secondary role using the ' +
+                    'assumed-role from LastPass.  Note that only the alternate credentials will be saved.')
+    group_alt.add_argument('--alt-arn', dest='alt_arn',
+                    help='Full ARN in the format: arn:aws:iam::123456789012:role/newrole')
+    group_alt.add_argument('--alt-account', dest='alt_account',
+                    help='AWS Account number to assume (must also provide --alt-role)'),
+    group_alt.add_argument('--alt-role', dest='alt_role',
+                    help='IAM Role name in the --alt-account to assume (must also provide --alt-account')
+
     args = parser.parse_args()
     
     username = args.username
@@ -315,6 +364,16 @@ def main():
     else:
         profile_name = username
     
+    alt_arn = None
+    if args.alt_account is not None or args.alt_role is not None or args.alt_arn is not None:
+        if args.alt_account is not None and args.alt_role is not None:
+            alt_arn = "arn:aws:iam::{0}:role/{1}".format(args.alt_account, args.alt_role)
+        else:
+            if args.alt_arn is not None:
+                alt_arn = args.alt_arn
+            else:
+                raise argparse.ArgumentError(group_alt, 'alt-role and alt-account must both be specified')
+
     password = getpass()
 
     session = requests.Session()
@@ -330,8 +389,13 @@ def main():
 
     role = prompt_for_role(roles)
 
-    response = aws_assume_role(session, assertion, role[0], role[1], duration)
-    aws_set_profile(profile_name, response)
+    if alt_arn is None:
+        response = aws_assume_role(session, assertion, role[0], role[1], duration)
+        aws_set_profile(profile_name, response)
+    else:
+        response = aws_assume_role(session, assertion, role[0], role[1], 900)
+        alt_response = aws_assume_role_alt(response, alt_arn, profile_name, duration)
+        aws_set_profile(profile_name, alt_response)
 
     print "A new AWS CLI profile '%s' has been added." % profile_name
     print "You may now invoke the aws CLI tool as follows:"
@@ -345,4 +409,6 @@ if __name__ == "__main__":
     try:
         main()
     except argparse.ArgumentError as e:
-        print "ERROR: Argument Error: {0}".format(e)
+        logger.error(e)
+    except ValueError as e:
+        logger.error(e)
