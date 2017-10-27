@@ -249,12 +249,13 @@ def prompt_for_role(roles):
     return roles[choice - 1]
 
 
-def aws_assume_role(session, assertion, role_arn, principal_arn):
+def aws_assume_role(session, assertion, role_arn, principal_arn, duration=3600):
     client = boto3.client('sts')
     return client.assume_role_with_saml(
                 RoleArn=role_arn,
                 PrincipalArn=principal_arn,
-                SAMLAssertion=b64encode(assertion))
+                SAMLAssertion=b64encode(assertion),
+                DurationSeconds=duration)
 
 
 def aws_set_profile(profile_name, response):
@@ -297,11 +298,17 @@ def main():
                     help='the lastpass SAML config id')
     parser.add_argument('--profile-name', dest='profile_name',
                     help='the name of AWS profile to save the data in (default username)')
+    duration_arg = parser.add_argument('--duration', type=int, default=3600, dest='duration',
+                    help='duration in seconds (900-3600) of the role session (default is 3600 or 1 hour)')
 
     args = parser.parse_args()
     
     username = args.username
     saml_cfg_id = args.saml_config_id
+    duration = args.duration
+
+    if duration < 900 or duration > 3600:
+        raise argparse.ArgumentError(duration_arg, 'Duration must be between 900 and 3600 seconds.')
 
     if args.profile_name is not None:
         profile_name = args.profile_name
@@ -323,7 +330,7 @@ def main():
 
     role = prompt_for_role(roles)
 
-    response = aws_assume_role(session, assertion, role[0], role[1])
+    response = aws_assume_role(session, assertion, role[0], role[1], duration)
     aws_set_profile(profile_name, response)
 
     print "A new AWS CLI profile '%s' has been added." % profile_name
@@ -331,8 +338,11 @@ def main():
     print
     print "    aws --profile %s [...] " % profile_name
     print
-    print "This token expires in one hour."
+    print "This token expires in {0}:{1:02d} minutes.".format(duration//60, duration%60)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except argparse.ArgumentError as e:
+        print "ERROR: Argument Error: {0}".format(e)
