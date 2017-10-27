@@ -86,3 +86,25 @@ You may now invoke the aws CLI tool as follows:
 This token expires in 60:00 minutes.
 ```
 
+# aws-sts-switch-role
+
+If you used ```lp-aws-saml``` to save a set of credentials, and you have one or
+more other credential sets that you need to use simultaneously (such as managing 
+multiple AWS organization accounts, or using services only accessible by separate
+roles), use ```aws-sts-switch-role``` to save a new profile with new credentials
+based on the role rights in the original that includes the right to assume-role.
+
+All existing credentials are maintained (unless you specify the target ```profile_name```
+as the same name as the reference ```using_session``` name).
+
+Example:
+
+```
+$ ./aws-sts-switch-role.py -d 900 saml1 admin2 -a 123456789012 -r Org2Admin
+A new AWS CLI profile 'admin2' has been added.
+You may now invoke the aws CLI tool as follows:
+
+    aws --profile admin2 [...] 
+
+This token expires in 15:00 minutes.
+```
