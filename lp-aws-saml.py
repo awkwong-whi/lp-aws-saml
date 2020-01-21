@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
 # -*- coding: utf8 -*-
 #
 # Amazon Web Services CLI - LastPass SAML integration
@@ -54,6 +54,25 @@ logger = logging.getLogger('lp-aws-saml')
 
 class MfaRequiredException(Exception):
     pass
+
+class ResponseValueError(ValueError):
+    """
+    given the html response text, extract the title from the H2 and
+    return a ValueError exception object with the extracted title
+    after the provided message.
+    """
+    def __init__(self, message, response):
+        error = ""
+        for l in response.text.splitlines():
+            match = re.search(r'<h2>(.*)</h2>', l)
+            if match:
+                msg = html_parser.HTMLParser().unescape(match.group(1))
+                msg = msg.replace("<br/>", "\n")
+                msg = msg.replace("<b>", "")
+                msg = msg.replace("</b>", "")
+                error = "\n" + msg
+        super(ResponseValueError, self).__init__(message + error)
+
 
 def should_verify():
     """ Disable SSL validation only when debugging via proxy """
@@ -170,6 +189,73 @@ def lastpass_login(session, username, password, otp = None):
             raise ValueError("Could not login to lastpass: %s" % reason)
 
 
+def identity_login(session):
+    """
+    Log into LastPass Identity from LastPass.
+    You must have already logged into LastPass using
+    the provided session.
+    """
+
+    idp_login = '%s/saml/launch/nopassword?RelayState=/' % (LASTPASS_SERVER)
+    r = session.get(idp_login, verify=should_verify())
+
+    form = extract_form(r.text)
+    if not form['action']:
+        raise ResponseValueError("Unable to find SAML ACS for identity.lastpass.com", r)
+    else:
+        r = session.post(form['action'], data=form['fields'], verify=should_verify())
+        if r.status_code > 299:
+            raise ResponseValueError("Unable to authenticate with identity.lastpass.com", r)
+
+
+def get_app_list(session):
+    """
+    Query identity.lastpass.com API to retrieve the list of
+    Web Apps and display their associated GUID Id's.
+    You must already have logged into LastPass using the
+    provided session.
+    You must also already have logged into
+    identity.lastpass.com using identity_login() with the
+    same session.
+    """
+
+    # Use Apps/list API
+    list_apps_url = 'https://identity.lastpass.com/api/v2/Apps/list'
+    page = 1
+    app_list = []
+
+    # API was intended for a Web Interface.  The UI is typically
+    # paginated to 10 per page.  Use the same pagination here.
+    # We're only interested in SAML based applications.
+    # API expects the accept field to indicate a json response.
+    while True:
+        p = { "size": 10, "page": page, "onlySaml": True, "onlyPassword":False  }
+        h = { "accept": "application/json" }
+        r = session.get(list_apps_url, params=p, headers=h, verify=should_verify())
+        if r.status_code > 299:
+            raise ResponseValueError("Unable to retrieve apps list from identity.lastpass.com", r)
+
+        # Response includes two fields:
+        #   * total   -- (int)   total number of matching web applications
+        #   * results -- (obj[]) a list of web application objects
+        #
+        # Web Application objects have two fields of interest:
+        #   * id      -- (str)   GUID representing the Web Application ID
+        #                        and is also the /redirect?id=xxxxxxxx
+        #                        target that you can then use as the
+        #                        saml_cfg_id.
+        #   * name    -- (str)   The Name of the Web App as configured
+        #                        by the LastPass Administrator.
+        apps = r.json()
+        for app in apps["results"]:
+            app_list.append({"id": app["id"], "name": app["name"]})
+        if len(app_list) >= apps["total"]:
+            break
+        else:
+            page = page + 1
+
+    return app_list
+
 def get_saml_token(session, username, password, saml_cfg_id):
     """
     Log into LastPass and retrieve a SAML token for a given
@@ -178,27 +264,31 @@ def get_saml_token(session, username, password, saml_cfg_id):
     logger.debug("Getting SAML token")
 
     # now logged in, grab the SAML token from the IdP-initiated login
-    idp_login = '%s/saml/launch/cfg/%d' % (LASTPASS_SERVER, saml_cfg_id)
+    if saml_cfg_id.isdigit():
+        idp_login = '%s/saml/launch/cfg/%d' % (LASTPASS_SERVER, int(saml_cfg_id))
+    else:
+        idp_login = '%s/saml/launch/nopassword?RelayState=/redirect%%3Fid%%3D%s' % (LASTPASS_SERVER, saml_cfg_id)
+
+    # if we are logging in and then using identity.lastpass.com, we are effectively
+    # chaining SAML logins.  LastPass first authenticates to identity.lastpass.com,
+    # then identity.lastpass.com will provide the SAMLResponse for AWS.
+    intermediate_acs_list = [
+        'https://identity.lastpass.com/SAML/AssertionConsumerService'
+    ]
 
     r = session.get(idp_login, verify=should_verify())
+    while True:
+        form = extract_form(r.text)
+        if not form['action']:
+            raise ResponseValueError("Unable to find SAML ACS",r)
 
-    form = extract_form(r.text)
-    if not form['action']:
-        # try to scrape the error message just to make it more user friendly
-        error = ""
-        for l in r.text.splitlines():
-            match = re.search(r'<h2>(.*)</h2>', l)
-            if match:
-                msg = html_parser.HTMLParser().unescape(match.group(1))
-                msg = msg.replace("<br/>", "\n")
-                msg = msg.replace("<b>", "")
-                msg = msg.replace("</b>", "")
-                error = "\n" + msg
-
-        raise ValueError("Unable to find SAML ACS" + error)
+        if form['action'] in intermediate_acs_list:
+            # post this intermediate SAMLResponse to the specified intermediate ACS
+            r = session.post(form['action'], data=form['fields'], verify=should_verify())
+        else:
+            break
 
     return b64decode(form['fields']['SAMLResponse'])
-
 
 def get_saml_aws_roles(assertion):
     """
@@ -329,11 +419,20 @@ def aws_set_profile(profile_name, response):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Get temporary AWS access credentials using LastPass SAML Login')
+    parser = argparse.ArgumentParser(
+                    description='Get temporary AWS access credentials using LastPass SAML Login',
+                    epilog=(
+                          'The saml_config_id can be classic or Legacy SSO SAML config '
+                          'id found at the end of the lastpass.com/saml/launch/cfg/XXXXX '
+                          'URL.  It can also be the LastPass Identity Web App Id which is '
+                          'a GUID: (00000000-0000-0000-0000-000000000000). You can obtain '
+                          'this ID by specifying "list" instead.  After you login, it will '
+                          'Print out a list Web App Ids and their configured Web App names.'
+                    ))
     parser.add_argument('username', type=str,
                     help='the lastpass username')
-    parser.add_argument('saml_config_id', type=int,
-                    help='the lastpass SAML config id')
+    parser.add_argument('saml_config_id', type=str,
+                    help='the LastPass Application ID (number | GUID | "list")')
     parser.add_argument('--profile-name', dest='profile_name',
                     help='the name of AWS profile to save the data in (default username)')
     duration_arg = parser.add_argument('--duration', type=int, default=3600, dest='duration',
@@ -382,6 +481,15 @@ def main():
     except MfaRequiredException:
       otp = input("OTP: ")
       lastpass_login(session, username, password, otp)
+
+    if saml_cfg_id == "list":
+        identity_login(session)
+        app_list = get_app_list(session)
+
+        print("Web Application Id ----------------- Application Name ---------------------------")
+        for app in app_list:
+            print("%s %s" % (app["id"], app["name"]))
+        return
 
     assertion = get_saml_token(session, username, password, saml_cfg_id)
     roles = get_saml_aws_roles(assertion)
