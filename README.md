@@ -26,12 +26,26 @@ LastPass AWS configuration page for more information.
 ## Usage
 
 First you will need to look up the LastPass SAML configuration ID for the AWS
-instance you wish to control.  This can be obtained from the generated
-Launch URL: if the launch URL is ```https://lastpass.com/saml/launch/cfg/25```
-then the configuration ID is ```25```.
+instance you wish to control.  There are two types of configuration ID's 
+supported:
+
+* Legacy SAML Configuration ID (numeric)
+* Application ID from identity.lastpass.com (GUID)
 
 Then launch the tool to login to lastpass.  You will be prompted for
-password and optionally the AWS role to assume:
+password and optionally the AWS role to assume.
+
+Once completed, the ```aws``` tool may be used to execute commands as that
+user by specifying the appropriate profile.
+
+
+### Legacy SAML Configuration ID
+
+The Legacy SAML Configuration ID can be obtained from the generated
+Launch URL. if the launch URL is ```https://lastpass.com/saml/launch/cfg/25```
+then the configuration ID is ```25```.
+
+Example:
 
 ```
 $ ./lp-aws-saml.py user@example.com 25
@@ -41,11 +55,43 @@ You may now invoke the aws CLI tool as follows:
 
     aws --profile user@example.com [...]
 
-This token expires in one hour.
+This token expires in 60:00 minutes.
 ```
 
-Once completed, the ```aws``` tool may be used to execute commands as that
-user by specifying the appropriate profile.
+### Application ID from identity.lastpass.com
+
+The Application ID is a GUID that uniquely represents the Web Application
+configured for the AWS instance you intend to log into.  The ID can be
+obtained by running this script and specifying ```list``` as the 
+Configuration ID.  Once you login to LastPass, it will login to 
+identity.lastpass.com and then retrieve the list of applications and 
+provide you with their Id's and their configured names.
+
+You can then provide the GUID for the correct Application as the
+Configuration Id.
+
+List Application Ids Example:
+
+```
+$ ./lp-aws-saml.py user@example.com list
+Password:
+Web Application Id ----------------- Application Name ---------------------------
+aaaaaaaa-1111-2222-3333-444444444444 AWS Account (123456789111)
+bbbbbbbb-1111-2222-3333-444444444444 AWS Account (123456789222)
+```
+
+Example Login:
+
+```
+$ ./lp-aws-saml.py user@example.com aaaaaaaa-1111-2222-3333-444444444444
+Password:
+A new AWS CLI profile 'user@example.com' has been added.
+You may now invoke the aws CLI tool as follows:
+
+    aws --profile user@example.com [...]
+
+This token expires in 60:00 minutes.
+```
 
 ### Assume an Alternate Role
 
