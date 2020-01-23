@@ -1,4 +1,4 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 # -*- coding: utf8 -*-
 #
 # Amazon Web Services CLI - LastPass SAML integration
@@ -26,18 +26,15 @@
 import sys
 import re
 import requests
-import hmac
 import hashlib
-import binascii
 import logging
 import xml.etree.ElementTree as ET
 from base64 import b64decode, b64encode
-from struct import pack
 import os
 import argparse
+import json
 
 import boto3
-from six.moves import input
 from six.moves import html_parser
 from six.moves import configparser
 
@@ -48,6 +45,16 @@ LASTPASS_SERVER = 'https://lastpass.com'
 # for debugging with proxy
 PROXY_SERVER = 'https://127.0.0.1:8443'
 # LASTPASS_SERVER = PROXY_SERVER
+
+# A list of ACS URL's found in the form action url to where the
+# SAMLResponse's will be posted to.  This is a list of 
+# recognized intermediate ACS endpoints that should be considered
+# as an intermediate ACS (that is, this is not the final AWS
+# ACS endpoint).
+intermediate_acs_list = [
+    'https://identity.lastpass.com/SAML/AssertionConsumerService'
+]
+
 
 logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger('lp-aws-saml')
@@ -79,6 +86,14 @@ def should_verify():
     return LASTPASS_SERVER != PROXY_SERVER
 
 
+def get_input(message):
+      """
+      Returns a string from stdin after printing a message or
+      prompt to stderr.
+      """
+      print(f"{message}: ", end="", file=sys.stderr)
+      return input()
+
 def extract_form(html):
     """
     Retrieve the (first) form elements from an html page.
@@ -101,42 +116,14 @@ def extract_form(html):
     }
     return form
 
-
-def xorbytes(a, b):
-    """ xor all bytes in a string """
-    return ''.join(map(lambda x, y: chr(ord(x) ^ ord(y)), a, b))
-
-
-def prf(h, data):
-    """ internal hash update for pbkdf2/hmac-sha256 """
-    hm = h.copy()
-    hm.update(data)
-    return hm.digest()
-
-
-def pbkdf2(password, salt, rounds, length):
-    """
-    PBKDF2-SHA256 password derivation.
-    """
-    key = ''
-    h = hmac.new(password, None, hashlib.sha256)
-    for block in range(0, (length + 31) / 32):
-        ib = hval = prf(h, salt + pack(">I", block + 1))
-
-        for i in range(1, rounds):
-            hval = prf(h, hval)
-            ib = xorbytes(ib, hval)
-
-        key = key + ib
-    return binascii.hexlify(key[0:length])
-
-
+ 
 def lastpass_login_hash(username, password, iterations):
     """
     Determine the number of PBKDF2 iterations needed for a user.
+    Use pbkdf2_hmac() library function.
     """
-    key = binascii.unhexlify(pbkdf2(password, username, iterations, 32))
-    result = pbkdf2(key, password, 1, 32)
+    key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), username.encode('utf-8'), iterations, 32)
+    result = hashlib.pbkdf2_hmac('sha256', key, password.encode('utf-8'), 1, 32).hex()
     return result
 
 
@@ -145,7 +132,7 @@ def lastpass_iterations(session, username):
     Determine the number of PBKDF2 iterations needed for a user.
     """
     iterations = 5000
-    lp_iterations_page = '%s/iterations.php' % LASTPASS_SERVER
+    lp_iterations_page = f'{LASTPASS_SERVER}/iterations.php'
     params = {
         'email': username
     }
@@ -160,13 +147,13 @@ def lastpass_login(session, username, password, otp = None):
     """
     Log into LastPass with a given username and password.
     """
-    logger.debug("logging into lastpass as %s" % username)
+    logger.debug(f"logging into lastpass as {username}")
     iterations = lastpass_iterations(session, username)
 
-    lp_login_page = '%s/login.php' % LASTPASS_SERVER
+    lp_login_page = f'{LASTPASS_SERVER}/login.php'
 
     params = {
-        'method': 'web',
+        'method': 'cli',
         'xml': '1',
         'username': username,
         'hash': lastpass_login_hash(username, password, iterations),
@@ -186,7 +173,7 @@ def lastpass_login(session, username, password, otp = None):
             raise MfaRequiredException('Need MFA for this login')
         else:
             reason = error.get('message')
-            raise ValueError("Could not login to lastpass: %s" % reason)
+            raise ValueError(f"Could not login to lastpass: {reason}")
 
 
 def identity_login(session):
@@ -196,7 +183,7 @@ def identity_login(session):
     the provided session.
     """
 
-    idp_login = '%s/saml/launch/nopassword?RelayState=/' % (LASTPASS_SERVER)
+    idp_login = f'{LASTPASS_SERVER}/saml/launch/nopassword?RelayState=/'
     r = session.get(idp_login, verify=should_verify())
 
     form = extract_form(r.text)
@@ -233,7 +220,14 @@ def get_app_list(session):
         h = { "accept": "application/json" }
         r = session.get(list_apps_url, params=p, headers=h, verify=should_verify())
         if r.status_code > 299:
-            raise ResponseValueError("Unable to retrieve apps list from identity.lastpass.com", r)
+            message = f"Unable to retrieve apps list from identity.lastpass.com ({r.status_code})"
+            jr = r.json()
+            if "Message" in jr:
+               if r.status_code == 401:
+                   message += f"\nSSO administrator rights required. {jr['Message']}"
+               else:
+                   message += f"\n{jr['Message']}"
+            raise ResponseValueError(message, r)
 
         # Response includes two fields:
         #   * total   -- (int)   total number of matching web applications
@@ -256,6 +250,7 @@ def get_app_list(session):
 
     return app_list
 
+
 def get_saml_token(session, username, password, saml_cfg_id):
     """
     Log into LastPass and retrieve a SAML token for a given
@@ -265,17 +260,22 @@ def get_saml_token(session, username, password, saml_cfg_id):
 
     # now logged in, grab the SAML token from the IdP-initiated login
     if saml_cfg_id.isdigit():
-        idp_login = '%s/saml/launch/cfg/%d' % (LASTPASS_SERVER, int(saml_cfg_id))
+        idp_login = f'{LASTPASS_SERVER}/saml/launch/cfg/{saml_cfg_id}'
     else:
-        idp_login = '%s/saml/launch/nopassword?RelayState=/redirect%%3Fid%%3D%s' % (LASTPASS_SERVER, saml_cfg_id)
+        idp_login = f'{LASTPASS_SERVER}/saml/launch/nopassword?RelayState=/redirect%3Fid%3D{saml_cfg_id}'
 
     # if we are logging in and then using identity.lastpass.com, we are effectively
     # chaining SAML logins.  LastPass first authenticates to identity.lastpass.com,
     # then identity.lastpass.com will provide the SAMLResponse for AWS.
-    intermediate_acs_list = [
-        'https://identity.lastpass.com/SAML/AssertionConsumerService'
-    ]
-
+    #
+    # To support chaining, first GET from lastpass.com to initiate the
+    # IDP initiated login.  then, for each subsequent hop, post the
+    # returned SAMLResponse to the form[action] identified ACS url.
+    # eventually, it should end up at one of:
+    #
+    # * https://signin.aws.amazon.com/saml
+    # * https://signin.amazonaws-us-gov.com/saml
+    #
     r = session.get(idp_login, verify=should_verify())
     while True:
         form = extract_form(r.text)
@@ -290,6 +290,7 @@ def get_saml_token(session, username, password, saml_cfg_id):
 
     return b64decode(form['fields']['SAMLResponse'])
 
+
 def get_saml_aws_roles(assertion):
     """
     Get the AWS roles contained in the assertion.  This returns a list of
@@ -298,7 +299,7 @@ def get_saml_aws_roles(assertion):
     doc = ET.fromstring(assertion)
 
     role_attrib = 'https://aws.amazon.com/SAML/Attributes/Role'
-    xpath = ".//saml:Attribute[@Name='%s']/saml:AttributeValue" % role_attrib
+    xpath = f".//saml:Attribute[@Name='{role_attrib}']/saml:AttributeValue"
     ns = {'saml': 'urn:oasis:names:tc:SAML:2.0:assertion'}
 
     attribs = doc.findall(xpath, ns)
@@ -316,27 +317,41 @@ def get_saml_nameid(assertion):
     return doc.find(".//saml:NameID", ns).text
 
 
-def prompt_for_role(roles):
+def prompt_for_role(roles, role_name=None):
     """
-    Ask user which role to assume.
+    Ask user which role to assume.  If role_name is provided,
+    Return the role where the role_name is found at the end
+    of the role ARN: arn:aws:iam::xxxx:role/role_name.
     """
+    role = roles[0]
+
     if len(roles) == 1:
-        return roles[0]
+        return role
 
-    print 'Please select a role:'
-    count = 1
-    for r in roles:
-        print '  %d) %s' % (count, r[0])
-        count = count + 1
+    if role_name is None:
+        print('Please select a role:', file=sys.stderr)
+        count = 1
+        for r in roles:
+            print(f'  {count}) {r[0]}', file=sys.stderr)
+            count = count + 1
 
-    choice = 0
-    while choice < 1 or choice > len(roles) + 1:
-        try:
-            choice = int(input("Choice: "))
-        except ValueError:
-            choice = 0
+        choice = 0
+        while choice < 1 or choice > len(roles):
+            try:
+                choice = int(get_input("Choice"))
+            except ValueError:
+                choice = 0
+            role = roles[choice - 1]
+    else:
+        role = None
+        for r in roles:
+            if r[0].endswith(role_name):
+                role = r
+                break
+        if role is None:
+            raise ValueError(f"Role {role_name} not found in available roles.")
 
-    return roles[choice - 1]
+    return role
 
 
 def aws_assume_role(session, assertion, role_arn, principal_arn, duration=3600):
@@ -344,8 +359,9 @@ def aws_assume_role(session, assertion, role_arn, principal_arn, duration=3600):
     return client.assume_role_with_saml(
                 RoleArn=role_arn,
                 PrincipalArn=principal_arn,
-                SAMLAssertion=b64encode(assertion),
+                SAMLAssertion=b64encode(assertion).decode('utf-8'),
                 DurationSeconds=duration)
+
 
 def aws_assume_role_alt(response, alt_arn, session_name, duration=3600):
     """
@@ -386,7 +402,8 @@ def aws_assume_role_alt(response, alt_arn, session_name, duration=3600):
                 RoleSessionName=session_name,
                 DurationSeconds=duration)
 
-def aws_set_profile(profile_name, response):
+
+def aws_set_profile(profile_name, response, print_eval=False):
     """
     Save AWS credentials returned from Assume Role operation in
     ~/.aws/credentials INI file.  The credentials are saved in
@@ -408,15 +425,22 @@ def aws_set_profile(profile_name, response):
     except OSError:
         pass
 
-    config.set(section, 'aws_access_key_id',
-               response['Credentials']['AccessKeyId'])
-    config.set(section, 'aws_secret_access_key',
-               response['Credentials']['SecretAccessKey'])
-    config.set(section, 'aws_session_token',
-               response['Credentials']['SessionToken'])
-    with open(config_fn, 'w') as out:
-        config.write(out)
+    message = ""
+    if print_eval:
+        message = (f"export AWS_ACCESS_KEY_ID={response['Credentials']['AccessKeyId']}"
+                f" AWS_SECRET_ACCESS_KEY={response['Credentials']['SecretAccessKey']}"
+                f" AWS_SESSION_TOKEN={response['Credentials']['SessionToken']}")
+    else:
+        config.set(section, 'aws_access_key_id',
+                   response['Credentials']['AccessKeyId'])
+        config.set(section, 'aws_secret_access_key',
+                   response['Credentials']['SecretAccessKey'])
+        config.set(section, 'aws_session_token',
+                   response['Credentials']['SessionToken'])
+        with open(config_fn, 'w') as out:
+            config.write(out)
 
+    return message
 
 def main():
     parser = argparse.ArgumentParser(
@@ -435,8 +459,20 @@ def main():
                     help='the LastPass Application ID (number | GUID | "list")')
     parser.add_argument('--profile-name', dest='profile_name',
                     help='the name of AWS profile to save the data in (default username)')
+    parser.add_argument('--role-name', type=str, default=None,
+                    help='A role name (the end part of the Role ARN) to automatically select')
     duration_arg = parser.add_argument('--duration', type=int, default=3600, dest='duration',
                     help='duration in seconds (900-3600) of the role session (default is 3600 or 1 hour)')
+    parser.add_argument('--json', action='store_true',
+                    help='display application list in json format.')
+    parser.add_argument('--otp', type=str, default=None,
+                    help='provide the OTP value directly instead of asking. this overrides --prompt-otp.')
+    parser.add_argument('--prompt-otp', action='store_true',
+                    help='always ask for OTP after providing password.')
+    parser.add_argument('--silent-on-success', action='store_true',
+                    help='dont print anything on success')
+    parser.add_argument('--print-eval', action='store_true',
+                    help='print out credentials as eval-able exports')
 
     group_alt = parser.add_argument_group(
                     title='optional alternate role arguments', 
@@ -473,33 +509,43 @@ def main():
             else:
                 raise argparse.ArgumentError(group_alt, 'alt-role and alt-account must both be specified')
 
-    password = getpass()
+    password = getpass("Password: ", sys.stderr)
 
     session = requests.Session()
     try:
-      lastpass_login(session, username, password)
+        # Use the provided OTP value as a default if provided (it might time out though)
+        otp = args.otp
+        # Otherwise, immediately prompt for the OTP if requested
+        if args.otp is None and args.prompt_otp:
+            otp = get_input("OTP")
+        lastpass_login(session, username, password, otp)
     except MfaRequiredException:
-      otp = input("OTP: ")
-      lastpass_login(session, username, password, otp)
+        # either need OTP or provided OTP expired -- ask for a new one
+        otp = get_input("OTP")
+        lastpass_login(session, username, password, otp)
 
-    if saml_cfg_id == "list":
+    if saml_cfg_id.lower() in [ "list", "apps", "webapps", "web_apps" ]:
         identity_login(session)
         app_list = get_app_list(session)
 
-        print("Web Application Id ----------------- Application Name ---------------------------")
-        for app in app_list:
-            print("%s %s" % (app["id"], app["name"]))
+        if args.json:
+            print(json.dumps(app_list,indent=2))
+        else:
+            print("Web Application Id ----------------- Application Name ---------------------------")
+            for app in app_list:
+                print(f'{app["id"]} {app["name"]}')
+
         return
 
     assertion = get_saml_token(session, username, password, saml_cfg_id)
     roles = get_saml_aws_roles(assertion)
     user = get_saml_nameid(assertion)
 
-    role = prompt_for_role(roles)
+    role = prompt_for_role(roles, args.role_name)
 
     if alt_arn is None:
         response = aws_assume_role(session, assertion, role[0], role[1], duration)
-        aws_set_profile(profile_name, response)
+        eval_output = aws_set_profile(profile_name, response, args.print_eval)
     else:
         # Set duration for the Primary SAML role to the minimum (15 mins) to
         # ensure this temporary token will expire as fast as possible.
@@ -507,14 +553,17 @@ def main():
         # duration.
         response = aws_assume_role(session, assertion, role[0], role[1], 900)
         alt_response = aws_assume_role_alt(response, alt_arn, profile_name, duration)
-        aws_set_profile(profile_name, alt_response)
+        eval_output = aws_set_profile(profile_name, alt_response, args.print_eval)
 
-    print "A new AWS CLI profile '%s' has been added." % profile_name
-    print "You may now invoke the aws CLI tool as follows:"
-    print
-    print "    aws --profile %s [...] " % profile_name
-    print
-    print "This token expires in {0}:{1:02d} minutes.".format(duration//60, duration%60)
+    if args.print_eval:
+        print(eval_output)
+    elif not args.silent_on_success:
+        print(f"A new AWS CLI profile '{profile_name}' has been added.")
+        print("You may now invoke the aws CLI tool as follows:")
+        print("")
+        print(f"    aws --profile {profile_name} [...] ")
+        print("")
+        print(f"This token expires in {duration//60}:{duration%60:02d} minutes.")
 
 
 if __name__ == "__main__":
