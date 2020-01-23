@@ -35,8 +35,8 @@ import argparse
 import json
 
 import boto3
-from six.moves import html_parser
-from six.moves import configparser
+from html.parser import HTMLParser
+import configparser
 
 from getpass import getpass
 
@@ -73,7 +73,7 @@ class ResponseValueError(ValueError):
         for l in response.text.splitlines():
             match = re.search(r'<h2>(.*)</h2>', l)
             if match:
-                msg = html_parser.HTMLParser().unescape(match.group(1))
+                msg = HTMLParser().unescape(match.group(1))
                 msg = msg.replace("<br/>", "\n")
                 msg = msg.replace("<b>", "")
                 msg = msg.replace("</b>", "")

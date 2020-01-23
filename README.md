@@ -11,12 +11,12 @@ LastPass and then converts it into credentials for use with ```aws```.
 You will need python with the Amazon boto3 module and the AWS CLI tool.
 The latter may be installed with pip:
 ```
-    # pip install boto3 awscli
+    # pip install boto3 awscli requests
 ```
 On recent Mac platforms, you may need to pass --ignore-installed:
 
 ```
-    # pip install boto3 awscli --ignore-installed
+    # pip install boto3 awscli requests --ignore-installed
 ```
 
 You will also need to have integrated AWS with LastPass SAML through the
