@@ -33,9 +33,8 @@ from base64 import b64decode, b64encode
 import os
 import argparse
 import json
-
 import boto3
-from html.parser import HTMLParser
+import html
 import configparser
 
 from getpass import getpass
@@ -70,14 +69,40 @@ class ResponseValueError(ValueError):
     """
     def __init__(self, message, response):
         error = ""
-        for l in response.text.splitlines():
-            match = re.search(r'<h2>(.*)</h2>', l)
+        j = None
+        try:
+            j = response.json()
+            m = j.get("Message", j.get("message", None))
+            error += f"\n!    info: {m}" if m is not None else ''
+            je = j.get("Error", j.get("error", None))
+            if je is not None:
+                if type(je) is dict:
+                    m = je.get("Code", je.get("code", None))
+                    error += f"\n!    info: {m}" if m is not None else ''
+                    m = je.get("Message", je.get("message", None))
+                    error += f"\n!    info: {m}" if m is not None else ''
+                else:
+                    error += f"\n!    info: {je}"
+        except json.JSONDecodeError:
+            pass
+  
+        if j is None:
+            #  Extract title for page
+            title = re.findall(r'<title[^>]*>(.*)</title>', response.text, re.DOTALL)
+            if title:
+                for t in title:
+                    msg = html.unescape(t).strip()
+                    error += f"\n!    info: {msg}"
+
+            # Find all header elements and print the embedded text
+            match = re.findall(r'<h[0-9][^>]*>(.*)</h[0-9]>', response.text, re.DOTALL)
             if match:
-                msg = HTMLParser().unescape(match.group(1))
-                msg = msg.replace("<br/>", "\n")
-                msg = msg.replace("<b>", "")
-                msg = msg.replace("</b>", "")
-                error = "\n" + msg
+               for m in match:
+                   msg = html.unescape(m).strip()
+                   msg = re.sub(r'<br[^>]*/?>', '\n    info:', msg)
+                   msg = re.sub(r'<(span|i|b|em|strong|a )[^>]*/?>', '', msg)
+                   error += f"\n!    info: {msg}"
+
         super(ResponseValueError, self).__init__(message + error)
 
 
@@ -169,11 +194,15 @@ def lastpass_login(session, username, password, otp = None):
     error = doc.find("error")
     if error is not None:
         cause = error.get('cause')
-        if cause == 'googleauthrequired':
-            raise MfaRequiredException('Need MFA for this login')
+        if cause in [ 'googleauthrequired',  "otprequired", "microsoftauthrequired" ]:
+            raise MfaRequiredException(f'Need MFA ({cause.strip("required")}) for this login')
         else:
             reason = error.get('message')
-            raise ValueError(f"Could not login to lastpass: {reason}")
+            if cause == "unknown":
+                message = f"Could not login to lastpass: {reason}"
+            else:
+                message = f"Could not login to lastpass: {cause} - {reason}"
+            raise ValueError(message)
 
 
 def identity_login(session):
@@ -221,12 +250,8 @@ def get_app_list(session):
         r = session.get(list_apps_url, params=p, headers=h, verify=should_verify())
         if r.status_code > 299:
             message = f"Unable to retrieve apps list from identity.lastpass.com ({r.status_code})"
-            jr = r.json()
-            if "Message" in jr:
-               if r.status_code == 401:
-                   message += f"\nSSO administrator rights required. {jr['Message']}"
-               else:
-                   message += f"\n{jr['Message']}"
+            if r.status_code == 401:
+                message += f"\n!    SSO administrator rights required."
             raise ResponseValueError(message, r)
 
         # Response includes two fields:
@@ -325,31 +350,29 @@ def prompt_for_role(roles, role_name=None):
     """
     role = roles[0]
 
-    if len(roles) == 1:
-        return role
+    if len(roles) > 1:
+        if role_name is None:
+            print('Please select a role:', file=sys.stderr)
+            count = 1
+            for r in roles:
+                print(f'  {count}) {r[0]}', file=sys.stderr)
+                count += 1
 
-    if role_name is None:
-        print('Please select a role:', file=sys.stderr)
-        count = 1
-        for r in roles:
-            print(f'  {count}) {r[0]}', file=sys.stderr)
-            count = count + 1
-
-        choice = 0
-        while choice < 1 or choice > len(roles):
-            try:
-                choice = int(get_input("Choice"))
-            except ValueError:
-                choice = 0
+            choice = 0
+            while choice < 1 or choice > len(roles):
+                try:
+                    choice = int(get_input("Choice"))
+                except ValueError:
+                    choice = 0
             role = roles[choice - 1]
-    else:
-        role = None
-        for r in roles:
-            if r[0].endswith(role_name):
-                role = r
-                break
-        if role is None:
-            raise ValueError(f"Role {role_name} not found in available roles.")
+        else:
+            role = None
+            for r in roles:
+                if r[0].endswith(role_name):
+                    role = r
+                    break
+            if role is None:
+                raise ValueError(f"Role {role_name} not found in available roles.")
 
     return role
 
@@ -403,7 +426,7 @@ def aws_assume_role_alt(response, alt_arn, session_name, duration=3600):
                 DurationSeconds=duration)
 
 
-def aws_set_profile(profile_name, response, print_eval=False):
+def aws_set_profile(profile_name, response, print_eval=False, print_json=False):
     """
     Save AWS credentials returned from Assume Role operation in
     ~/.aws/credentials INI file.  The credentials are saved in
@@ -430,6 +453,21 @@ def aws_set_profile(profile_name, response, print_eval=False):
         message = (f"export AWS_ACCESS_KEY_ID={response['Credentials']['AccessKeyId']}"
                 f" AWS_SECRET_ACCESS_KEY={response['Credentials']['SecretAccessKey']}"
                 f" AWS_SESSION_TOKEN={response['Credentials']['SessionToken']}")
+    elif print_json:
+        filtered_response = {}
+        filtered_keys = [ 
+            'AssumedRoleUser',
+            'Audience',
+            'Credentials',
+            'Issuer',
+            'NameQualifier',
+            'PackedPolicySize',
+            'Subject',
+            'SubjectType' ]
+        for k in response:
+            if k in filtered_keys:
+                filtered_response[k] = response[k]
+        message = json.dumps(filtered_response, indent=2, sort_keys=True, default=lambda x: x.__str__())
     else:
         config.set(section, 'aws_access_key_id',
                    response['Credentials']['AccessKeyId'])
@@ -531,9 +569,12 @@ def main():
         if args.json:
             print(json.dumps(app_list,indent=2))
         else:
-            print("Web Application Id ----------------- Application Name ---------------------------")
+            print("+--------------------------------------+----------------------------------------------+")
+            print("| Web Application Id                   | Application Name                             |")
+            print("+--------------------------------------+----------------------------------------------+")
             for app in app_list:
-                print(f'{app["id"]} {app["name"]}')
+                print(f'| {app["id"]:<36.36} | {app["name"]:<44.44} |')
+            print("+--------------------------------------+----------------------------------------------+")
 
         return
 
@@ -545,7 +586,7 @@ def main():
 
     if alt_arn is None:
         response = aws_assume_role(session, assertion, role[0], role[1], duration)
-        eval_output = aws_set_profile(profile_name, response, args.print_eval)
+        eval_output = aws_set_profile(profile_name, response, args.print_eval, args.json)
     else:
         # Set duration for the Primary SAML role to the minimum (15 mins) to
         # ensure this temporary token will expire as fast as possible.
@@ -553,9 +594,9 @@ def main():
         # duration.
         response = aws_assume_role(session, assertion, role[0], role[1], 900)
         alt_response = aws_assume_role_alt(response, alt_arn, profile_name, duration)
-        eval_output = aws_set_profile(profile_name, alt_response, args.print_eval)
+        eval_output = aws_set_profile(profile_name, alt_response, args.print_eval, args.json)
 
-    if args.print_eval:
+    if args.print_eval or args.json:
         print(eval_output)
     elif not args.silent_on_success:
         print(f"A new AWS CLI profile '{profile_name}' has been added.")
