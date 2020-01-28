@@ -39,6 +39,7 @@ from html import unescape
 from configparser import ConfigParser
 from http.cookiejar import Cookie
 from getpass import getpass
+from urllib.parse import quote
 
 LASTPASS_SERVER = 'https://lastpass.com'
 
@@ -82,7 +83,7 @@ class ResponseValueError(ValueError):
                     else:
                         e += f"\n!    info: {prefix}{k} {v}"
             return e
-                        
+
         try:
             j = response.json()
             error = scan_dict(j)
@@ -90,7 +91,7 @@ class ResponseValueError(ValueError):
         except JSONDecodeError:
             # If not a JSON response, treat response as an html document
             # and find all header and title elements and print the embedded
-            # text.  (regex uses non-greedy scanning to find closest 
+            # text.  (regex uses non-greedy scanning to find closest
             # matching closing tag).
             error = ""
             match = re.findall(r'<(h[0-9]|title)[^>]*?>(.*?)</\s*?\1>', response.text, re.DOTALL|re.IGNORECASE)
@@ -104,7 +105,7 @@ class ResponseValueError(ValueError):
         super(ResponseValueError, self).__init__(message + error)
 
 
-def load_session(session, filename, username, ignore_session=False):
+def load_session(session, filename, username, use_session=False):
     """
     Safely loads cookies from a session file ```~/.lp_aws_saml``` where
     the session file is an ini style file with the cookies stored as:
@@ -131,12 +132,8 @@ def load_session(session, filename, username, ignore_session=False):
     indicate that the user must perform a full login first.
     """
     # start with not requiring the user to login
-    needs_auth = False
-    if ignore_session:
-        # make sure we indicate login is required if
-        # the session file is ignored.
-        needs_auth = True
-    else:
+    needs_auth = True
+    if use_session:
         if os.path.isfile(filename):
             sescfg = ConfigParser()
             sescfg.read(filename)
@@ -145,6 +142,7 @@ def load_session(session, filename, username, ignore_session=False):
                 cstr = sescfg.get(username, 'cookies')
                 if len(cstr) > 0:
                     cookies = json_loads(decompress(b64decode(cstr.encode())).decode())
+                    expired_cookies = 0
                     for cookie in cookies:
                         cookie_params = {}
                         for k, v in cookie.items():
@@ -160,23 +158,16 @@ def load_session(session, filename, username, ignore_session=False):
                             # that the user will need to login directly with
                             # lastpass first.
                             logger.info(f'Cookie {new_cookie.name} expired.')
-                            needs_auth = True
+                            expired_cookies += 1
                         else:
                             # restore this cookie to the current session
                             session.cookies.set_cookie(new_cookie)
-                else:
-                    # cookies was present but was empty
-                    needs_auth = True
-            else:
-                # cookies was not present
-                needs_auth = True
-        else:
-            # session file is not present
-            needs_auth = True
+                    if expired_cookies == 0:
+                        needs_auth = False
     return needs_auth
 
 
-def save_session(session, filename, username, clear_cookies=False):
+def save_session(session, filename, username, clear_cookies=True):
     """
     save the cookies from the current session into a saved
     session file that uses an ini style format.
@@ -429,7 +420,8 @@ def get_saml_token(session, saml_cfg_id):
     if saml_cfg_id.isdigit():
         idp_login = f'{LASTPASS_SERVER}/saml/launch/cfg/{saml_cfg_id}'
     else:
-        idp_login = f'{LASTPASS_SERVER}/saml/launch/nopassword?RelayState=/redirect%3Fid%3D{saml_cfg_id}'
+        idp_relay = quote(f'/redirect?id={saml_cfg_id}')
+        idp_login = f'{LASTPASS_SERVER}/saml/launch/nopassword?RelayState={idp_relay}'
 
     # if we are logging in and then using identity.lastpass.com, we are effectively
     # chaining SAML logins.  LastPass first authenticates to identity.lastpass.com,
@@ -490,14 +482,14 @@ def prompt_for_role(roles, role_name=None):
     Return the role where the role_name is found at the end
     of the role ARN: arn:aws:iam::xxxx:role/role_name.
     """
-    role = roles[0]
+    selected_role = roles[0]
 
     if len(roles) > 1:
         if role_name is None:
             print('Please select a role:', file=sys.stderr)
             count = 1
-            for r in roles:
-                print(f'  {count}) {r[0]}', file=sys.stderr)
+            for role_arn,principal_arn in roles:
+                print(f'  {count}) {role_arn}', file=sys.stderr)
                 count += 1
 
             choice = 0
@@ -506,17 +498,20 @@ def prompt_for_role(roles, role_name=None):
                     choice = int(get_input("Choice"))
                 except ValueError:
                     choice = 0
-            role = roles[choice - 1]
+            selected_role = roles[choice - 1]
         else:
-            role = None
-            for r in roles:
-                if r[0].endswith(role_name):
-                    role = r
+            matched_role = None
+            for role in roles:
+                role_arn, principal_arn = role
+                if role_arn.endswith(role_name):
+                    matched_role = role
                     break
-            if role is None:
+            if matched_role is None:
                 raise ValueError(f"Role {role_name} not found in available roles.")
+            else:
+                selected_role = matched_role
 
-    return role
+    return selected_role
 
 
 def aws_assume_role(session, assertion, role_arn, principal_arn, duration=3600):
@@ -528,98 +523,55 @@ def aws_assume_role(session, assertion, role_arn, principal_arn, duration=3600):
                 DurationSeconds=duration)
 
 
-def aws_assume_role_alt(response, alt_arn, session_name, duration=3600):
-    """
-    Returns a new STS assume-role response object using the
-    credentials provided from a previous assume_role call.
-
-    Credentials from the response parameter (typically created
-    in a previous call to ``aws_assume_role`` are used to then
-    assume a new role (Such as logging into a root AWS
-    Organization account, and then switching roles into an
-    account in the Organization that your main account has
-    rights to assume.
-
-    The newly assumed role will be based on the provide alt_arn ARN
-    value, and the session_name value in the assume_role
-    call.
-
-    Your final assumed ARN will typically then become:
-        ``arn:aws:sts::123456789012:assumed-role/rolename/session_name``
-
-    :param response: response object from ``aws_assume_role``
-    :param alt_arn: ARN of the role to assume
-    :param session_name: Session name
-    :param duration: duration in seconds (900-3600) of the role session
-    :type response: str
-    :type alt_arn: str
-    :type session_name: str
-    :type duration: int
-    :returns: The assume_role response object
-    """
-    credentials = response['Credentials']
-    client = aws_client('sts',
-                aws_access_key_id=credentials['AccessKeyId'],
-                aws_secret_access_key=credentials['SecretAccessKey'],
-                aws_session_token=credentials['SessionToken'])
-    return client.assume_role(
-                RoleArn=alt_arn,
-                RoleSessionName=session_name,
-                DurationSeconds=duration)
-
-
 def aws_set_profile(profile_name, response, print_eval=False, print_json=False):
     """
     Save AWS credentials returned from Assume Role operation in
     ~/.aws/credentials INI file.  The credentials are saved in
     a profile with [profile_name].
     """
-    config_fn = os.path.expanduser("~/.aws/credentials")
-
-    config = ConfigParser()
-    config.read(config_fn)
-
-    section = profile_name
-    if not config.has_section(section):
-        config.add_section(section)
-
-    try:
-        os.makedirs(os.path.dirname(config_fn))
-    except OSError:
-        pass
-
+    credential = response['Credentials']
     message = ""
+
     if print_eval:
-        message = (f"export AWS_ACCESS_KEY_ID={response['Credentials']['AccessKeyId']}"
-                f" AWS_SECRET_ACCESS_KEY={response['Credentials']['SecretAccessKey']}"
-                f" AWS_SESSION_TOKEN={response['Credentials']['SessionToken']}")
+        message = (f"export AWS_ACCESS_KEY_ID={credential['AccessKeyId']}"
+                f" AWS_SECRET_ACCESS_KEY={credential['SecretAccessKey']}"
+                f" AWS_SESSION_TOKEN={credential['SessionToken']}")
     elif print_json:
-        filtered_response = {}
-        filtered_keys = [
-            'AssumedRoleUser',
-            'Audience',
-            'Credentials',
-            'Issuer',
-            'NameQualifier',
-            'PackedPolicySize',
-            'Subject',
-            'SubjectType' ]
-        for k in response:
-            if k in filtered_keys:
-                filtered_response[k] = response[k]
-        message = json_dumps(filtered_response, indent=2, sort_keys=True, default=lambda x: x.__str__())
+        # REF:  https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sourcing-external.html
+        # NOTE: This set of output credentials is not cached!
+        if hasattr(credential['Expiration'],'isoformat'):
+            expiration = credential['Expiration'].isoformat(sep='T')
+        else:
+            expiration = str(credential['Expiration'])
+
+        credentials_for_external = {
+            "Version": 1,
+            "AccessKeyId":     credential['AccessKeyId'],
+            "SecretAccessKey": credential['SecretAccessKey'],
+            "SessionToken":    credential['SessionToken'],
+            "Expiration":      expiration
+        }
+        message = json_dumps(credentials_for_external, indent=2)
     else:
-        config.set(section, 'aws_access_key_id',
-                   response['Credentials']['AccessKeyId'])
-        config.set(section, 'aws_secret_access_key',
-                   response['Credentials']['SecretAccessKey'])
-        config.set(section, 'aws_session_token',
-                   response['Credentials']['SessionToken'])
+        config_fn = os.path.expanduser("~/.aws/credentials")
+        try:
+            os.makedirs(os.path.dirname(config_fn))
+        except OSError:
+            pass
+
+        config = ConfigParser()
+        config.read(config_fn)
+        section = profile_name
+        if not config.has_section(section):
+            config.add_section(section)
+
+        config.set(section, 'aws_access_key_id',     credential['AccessKeyId'])
+        config.set(section, 'aws_secret_access_key', credential['SecretAccessKey'])
+        config.set(section, 'aws_session_token',     credential['SessionToken'])
         with open(config_fn, 'w') as out:
             config.write(out)
 
     return message
-
 
 
 def main():
@@ -653,19 +605,10 @@ def main():
                     help='dont print anything on success')
     parser.add_argument('--print-eval', action='store_true',
                     help='print out credentials as eval-able exports')
+    parser.add_argument('--session', action='store_true', dest='use_session',
+                    help='use a session store (saves cookies for this user). ')
     parser.add_argument('--clear-session', action='store_true',
-                    help='ignore and remove the saved session information')
-
-    group_alt = parser.add_argument_group(
-                    title='optional alternate role arguments',
-                    description='Assume an alternate secondary role using the ' +
-                    'assumed-role from LastPass.  Note that only the alternate credentials will be saved.')
-    group_alt.add_argument('--alt-arn', dest='alt_arn',
-                    help='Full ARN in the format: arn:aws:iam::123456789012:role/newrole')
-    group_alt.add_argument('--alt-account', dest='alt_account',
-                    help='AWS Account number to assume (must also provide --alt-role)'),
-    group_alt.add_argument('--alt-role', dest='alt_role',
-                    help='IAM Role name in the --alt-account to assume (must also provide --alt-account')
+                    help='clear the session store for the current user.')
 
     args = parser.parse_args()
 
@@ -677,94 +620,89 @@ def main():
     else:
         profile_name = args.username
 
-    # Build the alt_arn string based on either args.alt_arn or both of args.alt_role and args.alt_account
-    alt_arn = None
-    if args.alt_account is not None or args.alt_role is not None or args.alt_arn is not None:
-        if args.alt_account is not None and args.alt_role is not None:
-            alt_arn = f"arn:aws:iam::{args.alt_account}:role/{args.alt_role}"
-        else:
-            if args.alt_arn is not None:
-                alt_arn = args.alt_arn
-            else:
-                raise ArgumentError(group_alt, 'alt-role and alt-account must both be specified')
-
-    # Setup a new session and load the cookies if available
+    # Setup a new session and load the cookies if requested and available
     session = Session()
-    needs_auth = load_session(session, SESSION_FILE, args.username, args.clear_session)
+    needs_auth = load_session(session, SESSION_FILE, args.username, args.use_session)
 
     # full login requires the password
-    if needs_auth:
-        password = getpass("Password: ", sys.stderr)
+    password = getpass("Password: ") if needs_auth else None
 
-    if args.saml_config_id.lower() in [ "list", "apps", "webapps", "web_apps" ]:
+    if args.saml_config_id.lower() in [ "list", "apps", "guid", "webapps", "web_apps" ]:
+        # Administrative user wants to print out a list of identity.lastpass.com application GUID's
+        #
         # Try to login to identity using the current session
-        try:
-            if needs_auth:
-                full_lastpass_login(session, args.username, password, args.otp, args.prompt_otp)
+        tries_remaining = 2
+        authenticated = False
+        while tries_remaining > 0 and not authenticated:
+            try:
+                if needs_auth:
+                    full_lastpass_login(session, args.username, password, args.otp, args.prompt_otp)
 
-            identity_login(session)
-        except (ResponseValueError, KeyError):
-            # We might need to login to lastpass again first
-            full_lastpass_login(session, args.username, password, args.otp, args.prompt_otp)
-            # try logging into identity again with refreshed credentials
-            identity_login(session)
+                identity_login(session)
+                authenticated = True
+            except (ResponseValueError, KeyError):
+                password = getpass("Password: ") if password is None else password
+                needs_auth = True
+                tries_remaining -= 1
 
-        app_list = get_app_list(session)
+        if authenticated:
+            app_list = get_app_list(session)
 
-        if args.json:
-            print(json_dumps(app_list,indent=2))
-        else:
-            print("+--------------------------------------+----------------------------------------------+")
-            print("| Web Application Id                   | Application Name                             |")
-            print("+--------------------------------------+----------------------------------------------+")
-            for app in app_list:
-                print(f'| {app["id"]:<36.36} | {app["name"]:<44.44} |')
-            print("+--------------------------------------+----------------------------------------------+")
+            if args.json:
+                print(json_dumps(app_list,indent=2))
+            else:
+                name_len = max(max(map(lambda x: len(x["name"]),app_list)), len("Application Name"))
+                guid_len = max(max(map(lambda x: len(x["id"]  ),app_list)), len("Application ID (GUID)"))
+                border = { "id": "-"*guid_len,            "name": "-"*name_len, "border": True }
+                title = { "id": "Application ID (GUID)", "name": "Application Name" }
+                rows = [ border, title, border ] + app_list + [ border ]
+                for row in rows:
+                    sepr = "+" if "border" in row else "|"
+                    fill = "-" if "border" in row else " "
+                    f_id = f"{fill}{row['id']:<{guid_len}.{guid_len}}{fill}"
+                    f_nm = f"{fill}{row['name']:<{name_len}.{name_len}}{fill}"
+                    print(f'{sepr}{f_id}{sepr}{f_nm}{sepr}')
 
-        save_session(session, SESSION_FILE, args.username, args.clear_session)
-        return
+    else:
+        # User wants to get AWS credentials via SAML
+        #
+        # Try to get the token using the current session
+        tries_remaining = 2
+        authenticated = False
+        while tries_remaining > 0 and not authenticated:
+            try:
+                if needs_auth:
+                    full_lastpass_login(session, args.username, password, args.otp, args.prompt_otp)
 
-    # Try to get the token using the current session
-    try:
-        if needs_auth:
-            full_lastpass_login(session, args.username, password, args.otp, args.prompt_otp)
+                assertion = get_saml_token(session, args.saml_config_id)
+                authenticated = True
+            except KeyError:
+                password = getpass("Password: ") if password is None else password
+                needs_auth = False
+                tries_remaining -= 1
 
-        assertion = get_saml_token(session, args.saml_config_id)
-    except KeyError:
-        # We might need to login to lastpass again first
-        full_lastpass_login(session, args.username, password, args.otp, args.prompt_otp)
-        # try initiating the saml process with refreshed credentials
-        assertion = get_saml_token(session, args.saml_config_id)
+        if authenticated:
+            roles = get_saml_aws_roles(assertion)
+            user = get_saml_nameid(assertion)
 
-    roles = get_saml_aws_roles(assertion)
-    user = get_saml_nameid(assertion)
+            role, principal = prompt_for_role(roles, args.role_name)
 
-    role = prompt_for_role(roles, args.role_name)
+            response = aws_assume_role(session, assertion, role, principal, args.duration)
+            eval_output = aws_set_profile(profile_name, response, args.print_eval, args.json)
+
+            if args.print_eval or args.json:
+                print(eval_output)
+            elif not args.silent_on_success:
+                print(f"A new AWS CLI profile '{profile_name}' has been added.")
+                print("You may now invoke the aws CLI tool as follows:")
+                print("")
+                print(f"    aws --profile {profile_name} [...] ")
+                print("")
+                print(f"This token expires in {args.duration//60}:{args.duration%60:02d} minutes.")
 
     # All interaction with LastPass are complete.
-    save_session(session, SESSION_FILE, args.username, args.clear_session)
-
-    if alt_arn is None:
-        response = aws_assume_role(session, assertion, role[0], role[1], args.duration)
-        eval_output = aws_set_profile(profile_name, response, args.print_eval, args.json)
-    else:
-        # Set duration for the Primary SAML role to the minimum (15 mins) to
-        # ensure this temporary token will expire as fast as possible.
-        # Alternate token duration will be set to the specified (or default)
-        # duration.
-        response = aws_assume_role(session, assertion, role[0], role[1], 900)
-        alt_response = aws_assume_role_alt(response, alt_arn, profile_name, args.duration)
-        eval_output = aws_set_profile(profile_name, alt_response, args.print_eval, args.json)
-
-    if args.print_eval or args.json:
-        print(eval_output)
-    elif not args.silent_on_success:
-        print(f"A new AWS CLI profile '{profile_name}' has been added.")
-        print("You may now invoke the aws CLI tool as follows:")
-        print("")
-        print(f"    aws --profile {profile_name} [...] ")
-        print("")
-        print(f"This token expires in {args.duration//60}:{args.duration%60:02d} minutes.")
+    if args.use_session or args.clear_session:
+        save_session(session, SESSION_FILE, args.username, args.clear_session)
 
 
 if __name__ == "__main__":
