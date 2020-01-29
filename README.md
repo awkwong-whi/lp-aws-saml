@@ -48,13 +48,13 @@ You can use the following options to change how the tool will work:
 
    ```arn:aws:iam::xxxx:role/role-name```
 * ```--duration``` specifies the duration of the token (900-3600) in seconds.
-* ```json``` will print provided credentials in JSON format for use with
+* ```--json``` will print provided credentials in JSON format for use with
    AWS CLI external credentials feature, or print the identity.lastpass.com
    web applications list in JSON format instead of a printed list.
 * ```--otp OTP``` provide the OTP value directly on the command line instead
     of prompting the user for the OTP (note -- it might timeout).
 * ```--prompt-otp``` always ask for the OTP after providing the password.
-* ```--sient-on-success``` don't print anything out on success (useful for
+* ```--silent-on-success``` don't print anything out on success (useful for
    use within a script).
 * ```--print-eval``` prints the credentials in a format that can be parsed
    by the shell eval function.
@@ -66,6 +66,48 @@ You can use the following options to change how the tool will work:
    however, that specifying both will load the current set of saved
    cookies into the current session, but then ensure that the cookies are
    removed upon completion.
+* ```--dump-assertion``` is an option only available if the 
+   ```aws_saml_diag.py``` file is in the same directory as the main 
+   script.  This will print a formatted JSON structure that you can read
+   to help identify possible misconfigurations in your IdP, which 
+   SAML attributes are being passed across with their associated values,
+   and what their associated IAM Condition strings are typically 
+   associated with the value from the Response, or from an Attribute
+   within the response.  Recognized attributes for:
+
+    Assertion Values:
+
+    * ```audience``` maps to ```/Response/Assertion/Conditions/AudienceRestriction/Audience```
+    * ```saml:aud``` maps to ```/Response/Assertion/Subject/SubjectConfirmationData[@Recipient]```
+    * ```saml:iss``` maps to ```/Response/Issuer```
+    * ```saml:sub``` maps to ```/Response/Assertion/Subject/NameID```
+    * ```saml:sub_type``` maps to ```/Response/Assertion/Subject/NameID[@Format]```
+
+    Attributes:
+
+    * ```https://aws.amazon.com/SAML/Attributes/Role```
+    * ```https://aws.amazon.com/SAML/Attributes/RoleSessionName```
+    * ```https://aws.amazon.com/SAML/Attributes/SessionDuration```
+    * ```https://aws.amazon.com/SAML/Attributes/PrincipalTag:____```
+    * ```https://aws.amazon.com/SAML/Attributes/TransitiveTagKeys```
+    * ```eduPerson*``` attributes
+    * ```eduOrg*``` attributes
+    * ```name``` for AD
+    * ```commonName``` for AD and X500
+    * ```givenName``` for AD and X500
+    * ```surname``` for ad and X500
+    * ```mail``` for AD and X500
+    * ```uid``` for AD and X500
+    * ```x500UniqueIdentifier``` for X500
+    * ```organizationStatus``` for X500
+
+    Generated Values:
+
+    * ```saml:doc```
+    * ```saml:namequalifier```
+
+   Generates a ```status_check``` at the bottom of the report that lists
+   out any issues or potential misconfigurations.
 
 ### Legacy SAML Configuration ID
 
