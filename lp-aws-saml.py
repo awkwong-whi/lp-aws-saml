@@ -43,14 +43,13 @@ from urllib.parse import quote
 from xml.etree import ElementTree
 
 try:
-    from aws_saml_diag import diag_enabled, dump_assertion_attributes
+    from bs4 import BeautifulSoup
 except ImportError:
-    def diag_enabled() -> bool:
-        """Diagnostics module is not available"""
-        return False
-    def dump_assertion_attributes(assertion: dict, response: Optional[dict]=None) -> None:
-        """Does nothing without diagnostic module"""
-        pass
+    pass
+try:
+    from aws_saml_diag import dump_assertion_attributes
+except ImportError:
+    pass
 
 LASTPASS_SERVER = 'https://lastpass.com'
 
@@ -368,6 +367,57 @@ def identity_login(session):
             raise ResponseValueError("Unable to authenticate with identity.lastpass.com", r)
 
 
+def get_legacy_app_list(session):
+    """
+    Query the enterprise_saml.php administrative page for
+    aws applications, and extract the configuration for each
+    listed application name and configuration number.
+    """
+    app_list = []
+
+    if 'bs4' in sys.modules:
+        legacy_saml_url = f"{LASTPASS_SERVER}/enterprise_saml.php?service=aws"
+
+        r = session.get(legacy_saml_url, verify=should_verify())
+        if r.status_code > 299:
+            message = f"Unable to retrieve apps from enterprise_saml admin page ({r.status_code})"
+            raise ResponseValueError(message, r)
+
+        # Legacy Application List is only visible in html.  Extract the
+        # configuration from each of the discovered form/input elements.
+        legacy_config_list = []
+        soup = BeautifulSoup(r.text, "lxml")
+        for form in soup.find_all("form", action="enterprise_saml.php"):
+            legacy_saml_cfg = { "form_id": form["id"] }
+            for inp in form.find_all("input", type=["checkbox","radio"], checked=True):
+                # Input elements must be in a checked state to be usable
+                legacy_saml_cfg[inp["name"]] = inp["value"]
+            for inp in form.find_all("input", type=["hidden", "text"]):
+                # other values are useful like hidden
+                legacy_saml_cfg[inp["name"]] = inp["value"]
+            for sel in form.find_all("select", attrs={"name":"groups[]"}):
+                # select uses option subelements for only selected items
+                if "groups" not in legacy_saml_cfg:
+                    legacy_saml_cfg["groups"] = {}
+                for opt in sel.find_all("option", selected=True):
+                    legacy_saml_cfg["groups"][opt["value"]] = opt.string
+            if ("scid" in legacy_saml_cfg and
+                    "enabled" in legacy_saml_cfg and
+                    legacy_saml_cfg["scid"] != "0" and
+                    legacy_saml_cfg["enabled"] == "enabled"):
+                # a scid of 0 represents a new configuration that isn't
+                # real. ignore that item. only include configurations that
+                # are enabled.
+                legacy_config_list.append(legacy_saml_cfg)
+
+        for legacy_config in legacy_config_list:
+            app_list.append({
+                "id": legacy_config["scid"],
+                "name": f"{legacy_config['knownas']} ({legacy_config['account_id']})"
+            })
+    return app_list
+
+
 def get_app_list(session):
     """
     Query identity.lastpass.com API to retrieve the list of
@@ -416,6 +466,8 @@ def get_app_list(session):
             break
         else:
             page = page + 1
+
+    app_list.extend(get_legacy_app_list(session))
 
     return app_list
 
@@ -621,7 +673,7 @@ def main():
     parser.add_argument('--clear-session', action='store_true',
                     help='clear the session store for the current user.')
 
-    if diag_enabled():
+    if "aws_saml_diag" in sys.modules:
         parser.add_argument('--dump-assertion', action='store_true',
                     help='dump a json structure describing the assertion and compare with response.')
 
@@ -707,7 +759,7 @@ def main():
 
             if args.print_eval or args.json:
                 print(eval_output)
-            elif diag_enabled() and args.dump_assertion:
+            elif "aws_saml_diag" in sys.modules and args.dump_assertion:
                 dump_assertion_attributes(assertion, response)
             elif not args.silent_on_success:
                 print(f"A new AWS CLI profile '{profile_name}' has been added.")
