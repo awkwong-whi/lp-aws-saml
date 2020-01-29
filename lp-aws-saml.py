@@ -23,23 +23,34 @@
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 #
-import os
-import sys
-import re
 import logging
-from json import JSONDecodeError, loads as json_loads, dumps as json_dumps
+import os
+import re
+import sys
+from argparse import ArgumentParser, ArgumentError
+from base64 import b64decode, b64encode
 from boto3 import client as aws_client
+from configparser import ConfigParser
+from getpass import getpass
+from hashlib import pbkdf2_hmac, sha1
+from html import unescape
+from http.cookiejar import Cookie
+from json import JSONDecodeError, loads as json_loads, dumps as json_dumps
 from lzma import compress, decompress
 from requests import Session
-from hashlib import pbkdf2_hmac
-from xml.etree import ElementTree
-from base64 import b64decode, b64encode
-from argparse import ArgumentParser, ArgumentError
-from html import unescape
-from configparser import ConfigParser
-from http.cookiejar import Cookie
-from getpass import getpass
+from typing import Optional
 from urllib.parse import quote
+from xml.etree import ElementTree
+
+try:
+    from aws_saml_diag import diag_enabled, dump_assertion_attributes
+except ImportError:
+    def diag_enabled() -> bool:
+        """Diagnostics module is not available"""
+        return False
+    def dump_assertion_attributes(assertion: dict, response: Optional[dict]=None) -> None:
+        """Does nothing without diagnostic module"""
+        pass
 
 LASTPASS_SERVER = 'https://lastpass.com'
 
@@ -610,6 +621,10 @@ def main():
     parser.add_argument('--clear-session', action='store_true',
                     help='clear the session store for the current user.')
 
+    if diag_enabled():
+        parser.add_argument('--dump-assertion', action='store_true',
+                    help='dump a json structure describing the assertion and compare with response.')
+
     args = parser.parse_args()
 
     if args.duration < 900 or args.duration > 3600:
@@ -692,6 +707,8 @@ def main():
 
             if args.print_eval or args.json:
                 print(eval_output)
+            elif diag_enabled() and args.dump_assertion:
+                dump_assertion_attributes(assertion, response)
             elif not args.silent_on_success:
                 print(f"A new AWS CLI profile '{profile_name}' has been added.")
                 print("You may now invoke the aws CLI tool as follows:")
@@ -699,6 +716,7 @@ def main():
                 print(f"    aws --profile {profile_name} [...] ")
                 print("")
                 print(f"This token expires in {args.duration//60}:{args.duration%60:02d} minutes.")
+
 
     # All interaction with LastPass are complete.
     if args.use_session or args.clear_session:
