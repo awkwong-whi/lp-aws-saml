@@ -23,6 +23,22 @@ You will also need to have integrated AWS with LastPass SAML through the
 AWS and LastPass management consoles.  See the SAML setup instructions on the
 LastPass AWS configuration page for more information.
 
+### Optional Requirements
+
+This script can be copied standalone into your development environment
+tools path.  The accompanying ```aws_saml_diag.py``` is not needed during 
+normal operation.
+
+The list applications feature uses ```BeautifulSoup``` (python package 
+```bs4```) to extract the Legacy Application ids from the Enterprise 
+Administrator Console page for AWS Legacy SAML Applications.  If this 
+package is not available, the applications list will only show web 
+applications from ```identity.lastpass.com```.  You can add this with:
+
+```
+    # pip install bs4
+```
+
 ## Usage
 
 First you will need to look up the LastPass SAML configuration ID for the AWS
@@ -113,7 +129,8 @@ You can use the following options to change how the tool will work:
 
 The Legacy SAML Configuration ID can be obtained from the generated
 Launch URL. if the launch URL is ```https://lastpass.com/saml/launch/cfg/25```
-then the configuration ID is ```25```.
+then the configuration ID is ```25```.  You can use the ```list``` feature
+to retrieve the list of legacy SAML AWS applications (requires ```bs4```).
 
 Example:
 
@@ -142,14 +159,21 @@ work.*
 You can then provide the GUID for the correct Application as the
 Configuration Id.
 
-List Application Ids Example:
+List Application Ids Example (with legacy SAML configurations shown):
 
 ```
 $ ./lp-aws-saml.py admin_user@example.com list
 Password:
-Web Application Id ----------------- Application Name ---------------------------
-aaaaaaaa-1111-2222-3333-444444444444 AWS Account (123456789111)
-bbbbbbbb-1111-2222-3333-444444444444 AWS Account (123456789222)
++--------------------------------------+------------------------------------+
+| Application ID (GUID)                | Application Name                   |
++--------------------------------------+------------------------------------+
+| aaaaaaaa-1111-2222-3333-444444444444 | AWS Account - DEV (123456789111)   |
+| bbbbbbbb-1111-2222-3333-444444444444 | AWS Account - PRD (123456789222)   |
+| xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx | Cool Service                       |
+| 11111                                | Amazon Web Services (123456789111) |
+| 22222                                | Amazon Web Services (123456789222) |
++--------------------------------------+------------------------------------+
+
 ```
 
 Example Login:
